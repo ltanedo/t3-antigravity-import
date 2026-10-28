@@ -1,0 +1,1144 @@
+diff --git a/apps/server/src/project/AgentSessionImporter.test.ts b/apps/server/src/project/AgentSessionImporter.test.ts
+index 69026f91..323dc41a 100644
+--- a/apps/server/src/project/AgentSessionImporter.test.ts
++++ b/apps/server/src/project/AgentSessionImporter.test.ts
+@@ -50,7 +50,7 @@ const persistence = Layer.mergeAll(
+ function candidate(
+   modelSelection: typeof CODEX_MODEL_SELECTION,
+   providerSessionId: string,
+-  provider: "codex" | "claudeAgent" = "codex",
++  provider: "codex" | "claudeAgent" | "antigravity" = "codex",
+ ) {
+   const providerInstanceId = modelSelection.instanceId;
+   return {
+@@ -386,3 +386,33 @@ it.effect(
+       });
+     }).pipe(Effect.scoped, Effect.provide(persistence)),
+ );
++
++it.effect("imports Antigravity history once without claiming native resume support", () =>
++  Effect.gen(function* () {
++    const source = candidate(
++      {
++        ...CODEX_MODEL_SELECTION,
++        instanceId: ProviderInstanceId.make("antigravity"),
++        model: "antigravity-default",
++      },
++      "11111111-1111-4111-8111-111111111111",
++      "antigravity",
++    );
++    const importer = yield* makeImporter([source]);
++    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
++    const projections = yield* ProjectionStore.ProjectionStoreV2;
++    const records = yield* projections.getThreadRecords(importId(source), [
++      "messages",
++      "providerThreads",
++    ]);
++    expect(records.messages.map((message) => message.text)).toEqual(["Fix it", "Fixed"]);
++    expect(records.providerThreads).toHaveLength(1);
++    expect(records.providerThreads[0]?.nativeThreadRef).toBeNull();
++    expect(records.thread.historyOrigin).toBe("v1_import");
++    const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
++    expect(
++      Option.getOrThrow(yield* runtimes.getByThreadId({ threadId: importId(source) })).resumeCursor,
++    ).toBeNull();
++  }).pipe(Effect.scoped, Effect.provide(persistence)),
++);
+diff --git a/apps/server/src/project/AgentSessionImporter.ts b/apps/server/src/project/AgentSessionImporter.ts
+index 11f168ff..b742371f 100644
+--- a/apps/server/src/project/AgentSessionImporter.ts
++++ b/apps/server/src/project/AgentSessionImporter.ts
+@@ -211,7 +211,7 @@ const make = Effect.gen(function* () {
+       }
+       return payload.value.importedTranscripts ?? [];
+     });
+-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
++    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources, input);
+     const importedThreadIds = new Set<ThreadId>();
+     let importedCount = 0;
+     let skippedCount = 0;
+@@ -260,9 +260,11 @@ const make = Effect.gen(function* () {
+               status: "stopped",
+               lastSeenAt: thread.updatedAt,
+               resumeCursor:
+-                thread.source === "codex"
+-                  ? { threadId: thread.providerSessionId }
+-                  : { threadId, resume: thread.providerSessionId },
++                thread.source === "antigravity"
++                  ? null
++                  : thread.source === "codex"
++                    ? { threadId: thread.providerSessionId }
++                    : { threadId, resume: thread.providerSessionId },
+               runtimePayload: { cwd: project.workspaceRoot },
+             },
+             { onConflict: "ignore" },
+@@ -335,11 +337,14 @@ const make = Effect.gen(function* () {
+             providerSessionId: null,
+             appThreadId: threadId,
+             ownerNodeId: null,
+-            nativeThreadRef: {
+-              driver,
+-              nativeId: thread.providerSessionId,
+-              strength: "strong",
+-            },
++            nativeThreadRef:
++              thread.source === "antigravity"
++                ? null
++                : {
++                    driver,
++                    nativeId: thread.providerSessionId,
++                    strength: "strong",
++                  },
+             nativeConversationHeadRef: null,
+             status: "idle",
+             firstRunOrdinal: null,
+diff --git a/apps/server/src/project/AgentSessionScanner.test.ts b/apps/server/src/project/AgentSessionScanner.test.ts
+index baf0f27f..aa325864 100644
+--- a/apps/server/src/project/AgentSessionScanner.test.ts
++++ b/apps/server/src/project/AgentSessionScanner.test.ts
+@@ -9,6 +9,7 @@ import {
+   ProviderInstanceId,
+   type ServerSettings as ContractServerSettings,
+ } from "@t3tools/contracts";
++import * as HostProcess from "@t3tools/shared/HostProcess";
+ import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
+ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+@@ -48,6 +49,7 @@ interface ScannerTestInput {
+   readonly codexHomePath: string;
+   readonly importedWorkspaceRoots?: ReadonlyArray<string>;
+   readonly configBaseDir?: string;
++  readonly homeDirectory?: string;
+   readonly providerInstances?: ContractServerSettings["providerInstances"];
+ }
+ 
+@@ -73,6 +75,7 @@ const layerScannerTest = (input: ScannerTestInput) =>
+           input.configBaseDir ?? { prefix: "t3code-scanner-config-" },
+         ),
+         layerProjectStore(input.importedWorkspaceRoots ?? []),
++        Layer.succeed(HostProcess.HomeDirectory, input.homeDirectory ?? NodeOS.homedir()),
+       ),
+     ),
+   );
+@@ -234,6 +237,84 @@ const makeFileIdentityFixture = Effect.fn("AgentSessionScanner.test.makeFileIden
+ );
+ 
+ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
++  it.effect("imports old Antigravity exports with full text and filters sources", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const temporary = yield* makeTempDir("t3-antigravity-import-");
++      const workspace = path.join(temporary, "workspace");
++      const configBaseDir = path.join(temporary, "config");
++      yield* fs.makeDirectory(workspace);
++      const filePath = path.join(
++        configBaseDir,
++        "userdata",
++        "imports",
++        "antigravity",
++        "session.trajectory.json",
++      );
++      const stamp = "2026-01-01T00:00:00.000Z";
++      yield* TestClock.setTime(Date.parse("2026-09-01T00:00:00.000Z"));
++      yield* writeTranscript({
++        filePath,
++        mtimeMs: Date.parse(stamp),
++        contents: encodeTranscriptRecord({
++          cascadeId: "11111111-1111-4111-8111-111111111111",
++          metadata: { createdAt: stamp },
++          t3Import: { workspaceRoot: workspace, title: "Old chat" },
++          steps: Array.from({ length: 240 }, (_, index) => ({
++            type:
++              index % 2 === 0 ? "CORTEX_STEP_TYPE_USER_INPUT" : "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
++            metadata: { createdAt: stamp },
++            ...(index % 2 === 0
++              ? { userInput: { userResponse: `Prompt ${index}` } }
++              : { plannerResponse: { response: `Reply ${index}` } }),
++          })),
++        }),
++      });
++      yield* Effect.gen(function* () {
++        const scanner = yield* AgentSessionScanner.AgentSessionScanner;
++        expect((yield* scanner.scan).candidates).toMatchObject([
++          { path: workspace, sources: ["antigravity"], threadCount: 1 },
++        ]);
++        expect(yield* scanner.recentThreads(workspace).pipe(Stream.runCollect)).toEqual([]);
++        const all = yield* scanner
++          .recentThreads(workspace, [], { fullHistory: true, sources: ["antigravity"] })
++          .pipe(Stream.runCollect);
++        expect(all).toHaveLength(1);
++        expect(all[0]?._tag).toBe("Importable");
++        if (all[0]?._tag === "Importable") {
++          expect(all[0].thread.messages).toHaveLength(240);
++          expect(all[0].thread.messages[0]?.text).toBe("Prompt 0");
++          expect(all[0].thread.messages[239]?.text).toBe("Reply 239");
++          const again = yield* scanner
++            .recentThreads(workspace, [all[0].source], { fullHistory: true })
++            .pipe(Stream.runCollect);
++          expect(again[0]?._tag).toBe("AlreadyImported");
++        }
++        expect(
++          yield* scanner
++            .recentThreads(workspace, [], { fullHistory: true, sources: ["codex"] })
++            .pipe(Stream.runCollect),
++        ).toEqual([]);
++      }).pipe(
++        Effect.provide(
++          layerScannerTest({
++            claudeHomePath: path.join(temporary, "claude"),
++            codexHomePath: path.join(temporary, "codex"),
++            configBaseDir,
++            homeDirectory: temporary,
++            providerInstances: {
++              [ProviderInstanceId.make("antigravity")]: {
++                driver: ProviderDriverKind.make("antigravity"),
++                enabled: true,
++              },
++            },
++          }),
++        ),
++      );
++    }).pipe(Effect.scoped),
++  );
++
+   describe("scan", () => {
+     it.effect("reads Claude project cwds from transcripts, newest first", () =>
+       Effect.gen(function* () {
+diff --git a/apps/server/src/project/AgentSessionScanner.ts b/apps/server/src/project/AgentSessionScanner.ts
+index 9c26b187..d43bdf53 100644
+--- a/apps/server/src/project/AgentSessionScanner.ts
++++ b/apps/server/src/project/AgentSessionScanner.ts
+@@ -8,6 +8,7 @@ import {
+   ProviderInstanceId,
+   resolveProviderInstanceEnabled,
+   type AgentSessionImportSource,
++  type AgentSessionImportInput,
+   type AgentSessionProjectCandidate,
+   type AgentSessionProjectGit,
+   type AgentSessionScanResult,
+@@ -34,6 +35,7 @@ import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+ import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
+ import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+ import * as ServerSettings from "../serverSettings.ts";
++import { readAntigravitySession } from "./AntigravitySessionReader.ts";
+ import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
+ import {
+   createTranscriptJsonReader,
+@@ -152,6 +154,7 @@ export class AgentSessionScanner extends Context.Service<
+     readonly recentThreads: (
+       workspaceRoot: string,
+       completedSources?: ReadonlyArray<AgentSessionImportSource>,
++      options?: Pick<AgentSessionImportInput, "fullHistory" | "sources">,
+     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+   }
+ >()("t3/project/AgentSessionScanner") {}
+@@ -306,6 +309,7 @@ function parseAgentSessionRecords(
+   input: AgentSessionTranscriptMetadata,
+   records: ReadonlyArray<DecodedTranscriptRecord>,
+   claudeFields: ClaudeFields,
++  messageLimit = MAX_IMPORTED_MESSAGES,
+ ): AgentSessionThread | null {
+   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
+   // Claude filenames are session IDs. Codex rollout filenames include extra
+@@ -383,7 +387,7 @@ function parseAgentSessionRecords(
+       derivedTitle = deriveTitle(input.source, message.text);
+     }
+     messages.push(message);
+-    if (messages.length > MAX_IMPORTED_MESSAGES) messages.shift();
++    if (messages.length > messageLimit) messages.shift();
+   };
+ 
+   const hasMatchingCodexEventInTurn = (text: string) => {
+@@ -484,7 +488,7 @@ function parseAgentSessionRecords(
+   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
+   const retainedMessages = firstUserMessageRetained
+     ? visibleMessages
+-    : [visibleFirstUserMessage, ...visibleMessages.slice(-(MAX_IMPORTED_MESSAGES - 1))];
++    : [visibleFirstUserMessage, ...visibleMessages.slice(-(messageLimit - 1))];
+ 
+   return {
+     source: input.source,
+@@ -1178,6 +1182,56 @@ export const make = Effect.gen(function* () {
+       truncated ||= metadataBudget.truncated;
+     }
+ 
++    const antigravityInstance = Object.entries(settings.providerInstances).find(
++      ([, instance]) =>
++        instance.driver === "antigravity" && resolveProviderInstanceEnabled(instance),
++    );
++    if (antigravityInstance) {
++      const providerInstanceId = ProviderInstanceId.make(antigravityInstance[0]);
++      const directories = [
++        path.join(serverConfig.stateDir, "imports", "antigravity"),
++        ...["antigravity", "antigravity-cli", "antigravity-ide"].map((name) =>
++          path.join(homeDir, ".gemini", name, "conversations"),
++        ),
++      ];
++      const seen = new Set<string>();
++      let remaining = MAX_TRANSCRIPTS_PER_SOURCE;
++      for (const directory of directories) {
++        for (const name of (yield* listDirectory(directory)).toSorted(
++          (a, b) => Number(b.endsWith(".trajectory.json")) - Number(a.endsWith(".trajectory.json")),
++        )) {
++          if (!name.endsWith(".db") && !name.endsWith(".trajectory.json")) continue;
++          if (--remaining < 0) {
++            truncated = true;
++            break;
++          }
++          const filePath = path.join(directory, name);
++          const session = yield* readAntigravitySession(filePath, true).pipe(
++            Effect.provideService(FileSystem.FileSystem, fileSystem),
++            Effect.option,
++          );
++          if (
++            Option.isNone(session) ||
++            session.value.paths.length !== 1 ||
++            seen.has(session.value.sessionId)
++          )
++            continue;
++          const stat = yield* statOption(filePath);
++          if (Option.isNone(stat) || stat.value.type !== "File") continue;
++          seen.add(session.value.sessionId);
++          const mtimeMs = Option.getOrNull(stat.value.mtime)?.getTime() ?? null;
++          raw.push({
++            cwd: session.value.paths[0]!,
++            source: "antigravity",
++            providerInstanceId,
++            threadCount: 1,
++            lastActiveAtMs: mtimeMs,
++            transcripts: [{ filePath, mtimeMs }],
++          });
++        }
++      }
++    }
++
+     return { candidates: raw, truncated };
+   });
+ 
+@@ -1305,13 +1359,14 @@ export const make = Effect.gen(function* () {
+   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
+     workspaceRoot: string,
+     completedSources: ReadonlyArray<AgentSessionImportSource>,
++    options: Pick<AgentSessionImportInput, "fullHistory" | "sources">,
+   ) {
+     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
+     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
+     if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
+     const rootIdentity = yield* directoryIdentity(root);
+     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+-    const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;
++    const cutoffMs = options.fullHistory ? -Infinity : nowMs - RECENT_THREAD_WINDOW_MS;
+ 
+     const candidates = cachedCandidates ?? (yield* collectCandidates()).candidates;
+     cachedCandidates = candidates;
+@@ -1321,6 +1376,7 @@ export const make = Effect.gen(function* () {
+       readonly transcript: RawCandidate["transcripts"][number] & { readonly mtimeMs: number };
+     }> = [];
+     for (const candidate of candidates) {
++      if (options.sources && !options.sources.includes(candidate.source)) continue;
+       const expanded = expandHomePath(candidate.cwd.trim(), homeDir);
+       if (!path.isAbsolute(expanded)) continue;
+       const resolved = path.resolve(expanded);
+@@ -1354,7 +1410,9 @@ export const make = Effect.gen(function* () {
+     );
+     const importedSessions = new Set<string>();
+     let bytesRemaining = MAX_IMPORT_BYTES;
+-    let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
++    let transcriptsRemaining = options.fullHistory
++      ? MAX_TRANSCRIPTS_PER_SOURCE
++      : MAX_IMPORT_TRANSCRIPTS;
+     let recordsRemaining = MAX_IMPORT_RECORDS;
+     return Stream.fromIteratorSucceed(eligibleTranscripts.values(), 1).pipe(
+       Stream.mapEffect(({ candidate, transcript }) =>
+@@ -1396,6 +1454,67 @@ export const make = Effect.gen(function* () {
+           }
+           transcriptsRemaining -= 1;
+           bytesRemaining -= identity.size;
++          if (candidate.source === "antigravity") {
++            const session = yield* readAntigravitySession(transcript.filePath).pipe(
++              Effect.provideService(FileSystem.FileSystem, fileSystem),
++              Effect.option,
++            );
++            const after = yield* statOption(transcript.filePath);
++            if (
++              Option.isNone(session) ||
++              Option.isNone(after) ||
++              !sameTranscriptIdentity(
++                identity,
++                transcriptIdentity(transcript.filePath, after.value),
++              ) ||
++              session.value.paths.length !== 1 ||
++              (yield* directoryIdentity(session.value.paths[0]!)) !== rootIdentity ||
++              session.value.stepCount > recordsRemaining
++            ) {
++              return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
++            }
++            recordsRemaining -= session.value.stepCount;
++            const data = session.value;
++            const source: AgentSessionImportSource = {
++              ...identity,
++              provider: "antigravity",
++              providerInstanceId: candidate.providerInstanceId,
++              providerSessionId: data.sessionId,
++            };
++            const key = `${candidate.providerInstanceId}\0${data.sessionId}`;
++            if (importedSessions.has(key))
++              return Option.some<AgentSessionRecentThread>({ _tag: "Duplicate", source });
++            importedSessions.add(key);
++            const messages = options.fullHistory
++              ? data.messages
++              : data.messages.slice(-MAX_IMPORTED_MESSAGES);
++            return Option.some<AgentSessionRecentThread>({
++              _tag: "Importable",
++              source,
++              thread: {
++                source: "antigravity",
++                providerInstanceId: candidate.providerInstanceId,
++                providerSessionId: data.sessionId,
++                model: null,
++                title:
++                  data.title ||
++                  data.messages
++                    .find((message) => message.role === "user")
++                    ?.text.trim()
++                    .slice(0, 120) ||
++                  "Imported Antigravity conversation",
++                createdAt:
++                  data.createdAt ??
++                  data.messages[0]?.createdAt ??
++                  DateTime.formatIso(DateTime.makeUnsafe(transcript.mtimeMs)),
++                updatedAt:
++                  data.messages[data.messages.length - 1]?.createdAt ??
++                  data.createdAt ??
++                  DateTime.formatIso(DateTime.makeUnsafe(transcript.mtimeMs)),
++                messages,
++              },
++            });
++          }
+           const snapshot = yield* readTranscript(
+             transcript.filePath,
+             identity,
+@@ -1427,6 +1546,7 @@ export const make = Effect.gen(function* () {
+             },
+             snapshot.records,
+             snapshot.claudeFields,
++            options.fullHistory ? MAX_IMPORT_RECORDS : MAX_IMPORTED_MESSAGES,
+           );
+           if (parsedThread === null) {
+             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+@@ -1458,7 +1578,8 @@ export const make = Effect.gen(function* () {
+   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
+     workspaceRoot,
+     completedSources = [],
+-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
++    options = {},
++  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, options));
+ 
+   return AgentSessionScanner.of({ scan, recentThreads });
+ });
+diff --git a/apps/web/src/components/onboarding/WelcomeWizard.tsx b/apps/web/src/components/onboarding/WelcomeWizard.tsx
+index 50d65192..006ced25 100644
+--- a/apps/web/src/components/onboarding/WelcomeWizard.tsx
++++ b/apps/web/src/components/onboarding/WelcomeWizard.tsx
+@@ -1192,6 +1192,8 @@ function ImportStep({
+   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
+   const importThreads = useAtomCommand(agentSessionImport, { reportFailure: false });
+   const [selectedPaths, setSelectedPaths] = useState<ReadonlySet<string> | null>(null);
++  const [fullHistory, setFullHistory] = useState(false);
++  const [antigravityOnly, setAntigravityOnly] = useState(false);
+   const importWarningRef = useRef("");
+   const importedThreadCountRef = useRef(0);
+   const importedProjectsRef = useRef(new Map<string, ScopedProjectRef>());
+@@ -1212,11 +1214,13 @@ function ImportStep({
+ 
+   const { available: candidates, recent } = partitionOnboardingProjects(
+     scans.flatMap((scan) =>
+-      (scan.data?.candidates ?? []).map((candidate) => ({
+-        ...candidate,
+-        environmentId: scan.environmentId,
+-        key: onboardingProjectKey(scan.environmentId, candidate.path),
+-      })),
++      (scan.data?.candidates ?? [])
++        .filter((candidate) => !antigravityOnly || candidate.sources.includes("antigravity"))
++        .map((candidate) => ({
++          ...candidate,
++          environmentId: scan.environmentId,
++          key: onboardingProjectKey(scan.environmentId, candidate.path),
++        })),
+     ),
+   );
+   const selectedKeys = selectedPaths ?? new Set(recent.map((candidate) => candidate.key));
+@@ -1351,7 +1355,12 @@ function ImportStep({
+       }
+       const threadImportResult = await importThreads({
+         environmentId,
+-        input: { projectId, expectedWorkspaceRoot: candidate.path },
++        input: {
++          projectId,
++          expectedWorkspaceRoot: candidate.path,
++          fullHistory,
++          ...(antigravityOnly ? { sources: ["antigravity" as const] } : {}),
++        },
+       });
+       if (
+         importGeneration !== importGenerationRef.current ||
+@@ -1403,7 +1412,7 @@ function ImportStep({
+         <div className="flex flex-1 flex-col items-center justify-center gap-3 py-6">
+           <Spinner size="lg" tone="muted" />
+           <p className="text-center text-sm text-muted-foreground">
+-            Looking for projects from Claude Code and Codex…
++            Looking for projects from Claude Code, Codex, and Antigravity…
+           </p>
+         </div>
+         <div className="flex justify-end">
+@@ -1418,7 +1427,7 @@ function ImportStep({
+   return (
+     <StepShell
+       title="Import your projects"
+-      description="Import projects and conversations from Claude Code and Codex on your selected computers."
++      description="Import projects and conversations from Claude Code, Codex, and Antigravity on your selected computers."
+     >
+       {candidates.length > 0 ? (
+         <div className="mt-5 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+@@ -1445,6 +1454,29 @@ function ImportStep({
+           </div>
+         </div>
+       ) : null}
++      <label className="mt-3 flex items-center gap-2 text-sm">
++        <Checkbox
++          checked={antigravityOnly}
++          disabled={isImporting}
++          onCheckedChange={(value) => setAntigravityOnly(value === true)}
++        />
++        Import Antigravity history only
++      </label>
++      <label className="mt-3 flex items-center gap-2 text-sm">
++        <Checkbox
++          checked={fullHistory}
++          disabled={isImporting}
++          onCheckedChange={(value) => setFullHistory(value === true)}
++        />
++        Include older conversations and full text history
++      </label>
++      {selected.some((candidate) => candidate.sources.includes("antigravity")) ? (
++        <p className="mt-2 text-xs text-muted-foreground">
++          Antigravity imports user and assistant text. Attachments and tool activity remain in the
++          original conversation. Continuing an imported conversation starts a new session with the
++          imported context.
++        </p>
++      ) : null}
+       <ScrollArea scrollFade className="mt-2 h-auto max-h-80">
+         <div className="space-y-5 pr-3">
+           {scans.map((scan) => {
+@@ -1480,7 +1512,7 @@ function ImportStep({
+                   </div>
+                 ) : scanCandidates.length === 0 ? (
+                   <p className="py-2 text-sm text-muted-foreground">
+-                    No existing Claude Code or Codex projects found.
++                    No existing Claude Code, Codex, or Antigravity projects found.
+                   </p>
+                 ) : null}
+                 {scan.data?.truncated ? (
+@@ -1720,14 +1752,14 @@ function ImportRowMeta({
+   threadCount,
+   lastActiveAt,
+ }: {
+-  readonly sources: ReadonlyArray<"claudeAgent" | "codex"> | null;
++  readonly sources: ReadonlyArray<"claudeAgent" | "codex" | "antigravity"> | null;
+   readonly threadCount: number;
+   readonly lastActiveAt: string | null;
+ }) {
+   const relative = lastActiveAt === null ? null : formatRelativeTime(lastActiveAt);
+   const age = relative === null ? "" : relative.suffix === null ? "now" : relative.value;
+   return (
+-    <span className="ml-auto grid shrink-0 grid-cols-[1rem_1rem_2.5rem_2.25rem] items-center gap-x-1 text-xs text-muted-foreground tabular-nums">
++    <span className="ml-auto grid shrink-0 grid-cols-[1rem_1rem_1rem_2.5rem_2.25rem] items-center gap-x-1 text-xs text-muted-foreground tabular-nums">
+       <span className="flex size-4 items-center justify-center">
+         {sources?.includes("claudeAgent") ? (
+           <span role="img" aria-label="Claude Code">
+@@ -1750,6 +1782,17 @@ function ImportRowMeta({
+           </span>
+         ) : null}
+       </span>
++      <span className="flex size-4 items-center justify-center">
++        {sources?.includes("antigravity") ? (
++          <span role="img" aria-label="Antigravity">
++            <ProviderInstanceIcon
++              driverKind={ProviderDriverKind.make("antigravity")}
++              displayName="Antigravity"
++              iconClassName="size-3"
++            />
++          </span>
++        ) : null}
++      </span>
+       <span className="text-right">{threadCount}</span>
+       <span className="text-right whitespace-nowrap">{age}</span>
+     </span>
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index 25e29747..e596fa7a 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -758,6 +758,17 @@ export function GeneralSettingsPanel() {
+ 
+   return (
+     <SettingsPageContainer>
++      <SettingsSection id="import-history" title="Import history">
++        <SettingsRow
++          title="Projects and conversations"
++          description="Import existing history from Claude Code, Codex, and Antigravity."
++          control={
++            <Button render={<Link to="/welcome" />} size="sm" variant="outline">
++              Import history
++            </Button>
++          }
++        />
++      </SettingsSection>
+       <SettingsSection id="notifications" title="Notifications">
+         <NotificationSettings />
+         <SettingsRow
+diff --git a/docs/user/welcome-wizard.md b/docs/user/welcome-wizard.md
+index d4604fa7..6b484694 100644
+--- a/docs/user/welcome-wizard.md
++++ b/docs/user/welcome-wizard.md
+@@ -9,7 +9,8 @@ computer. From home, it adds compatible computers linked to your account and
+ opens the app.
+ 
+ Close setup while no import is running to go straight to the app. You can connect
+-computers and agents later from Settings, or open `/welcome` to run setup again.
++computers and agents later from Settings, or choose **Settings → General → Import
++history** (or open `/welcome`) to run setup again.
+ Direct links, such as Settings, open normally before setup is done.
+ 
+ ## Connect your computers
+@@ -59,7 +60,7 @@ terminal metadata while the terminal process can use them.
+ 
+ ## Import your projects
+ 
+-T3 Code finds directories that Claude Code or Codex has used. Git repositories
++T3 Code finds directories that Claude Code, Codex, or an enabled Antigravity provider has used. Git repositories
+ are listed first, newest activity on top. When the remote is on GitHub, the
+ group shows the repository as `owner/name`. Clones with the same remote share
+ one group. Directories that are not git repositories sit under "Other folders".
+@@ -95,3 +96,25 @@ remaining history.
+ 
+ You can continue without configuring agents or importing projects, or return to an earlier step
+ using the setup progress bar. Navigation pauses while an import is running.
++
++### Antigravity history
++
++Enable Antigravity in Settings before scanning. The importer reads SQLite conversations
++from the standard Antigravity, CLI, and IDE stores. Older encrypted conversations need
++a local Antigravity trajectory export (`<conversation-id>.trajectory.json`). Exports can
++be placed in the host's T3 home under `userdata/imports/antigravity` or beside the original
++conversation. A staged export takes precedence over a database with the same conversation ID.
++A conversation must identify one existing workspace; exports may specify
++`t3Import.workspaceRoot` and `t3Import.title` to assign or rename an archived conversation.
++
++Select **Import Antigravity history only** to leave Claude Code and Codex history out of
++the import, including when they share the same project directory.
++Select **Include older conversations and full text history** to include conversations
++older than 30 days and retain more than 200 messages. This raises the per-attempt file
++limit to 5,000; the existing byte and input-record limits still apply.
++
++Antigravity imports user and assistant text, not tool activity or attachment data.
++Messages with attachments retain a notice. Keep the original conversations or exports
++for their other content. Continuing an imported chat starts a new agent session with
++context from the imported text; it does not resume the original Antigravity session.
++Open `/welcome` to repeat the import; existing imported threads are not duplicated.
+diff --git a/packages/contracts/src/agentSessions.ts b/packages/contracts/src/agentSessions.ts
+index a60d702d..3eed5977 100644
+--- a/packages/contracts/src/agentSessions.ts
++++ b/packages/contracts/src/agentSessions.ts
+@@ -2,7 +2,7 @@ import * as Schema from "effect/Schema";
+ import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+ import { ProviderInstanceId } from "./providerInstance.ts";
+ 
+-export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex"]);
++export const AgentSessionSource = Schema.Literals(["claudeAgent", "codex", "antigravity"]);
+ export type AgentSessionSource = typeof AgentSessionSource.Type;
+ 
+ export const AgentSessionImportSource = Schema.Struct({
+@@ -51,6 +51,8 @@ export type AgentSessionScanResult = typeof AgentSessionScanResult.Type;
+ export const AgentSessionImportInput = Schema.Struct({
+   projectId: ProjectId,
+   expectedWorkspaceRoot: Schema.optional(TrimmedNonEmptyString),
++  fullHistory: Schema.optional(Schema.Boolean),
++  sources: Schema.optional(Schema.Array(AgentSessionSource)),
+ });
+ export type AgentSessionImportInput = typeof AgentSessionImportInput.Type;
+ 
+diff --git a/apps/server/src/project/AntigravitySessionReader.ts b/apps/server/src/project/AntigravitySessionReader.ts
+new file mode 100644
+index 00000000..9ec82cf5
+--- /dev/null
++++ b/apps/server/src/project/AntigravitySessionReader.ts
+@@ -0,0 +1,137 @@
++import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Schema from "effect/Schema";
++import * as SqlClient from "effect/sql/SqlClient";
++import {
++  decodeAntigravityMessage,
++  decodeAntigravityWorkspace,
++  decodeAntigravityTrajectory,
++} from "./AntigravityTranscript.ts";
++
++class AntigravityTranscriptError extends Schema.TaggedError<AntigravityTranscriptError>()(
++  "AntigravityTranscriptError",
++  { path: Schema.String, cause: Schema.Defect() },
++) {
++  override get message() {
++    return `Could not read Antigravity history from ${this.path}.`;
++  }
++}
++
++const MAX_STEP_BYTES = 16 * 1024 * 1024;
++const MAX_TEXT_BYTES = 32 * 1024 * 1024;
++const MAX_STEPS = 100_000;
++const decodeTrajectoryJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
++
++const read = Effect.fn("AntigravitySessionReader.read")(function* (
++  path: string,
++  metadataOnly: boolean,
++) {
++  const sql = yield* SqlClient.SqlClient;
++  const decode = <A>(f: () => A) =>
++    Effect.try({
++      try: f,
++      catch: (cause) => new AntigravityTranscriptError({ path, cause }),
++    });
++  yield* sql.unsafe("PRAGMA busy_timeout = 1000");
++  return yield* Effect.gen(function* () {
++    const meta = yield* sql.unsafe<{ data: Uint8Array }>(
++      "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' AND length(data) <= ?",
++      [MAX_STEP_BYTES],
++    );
++    if (meta.length !== 1)
++      return yield* decode(() => {
++        throw new Error("Missing trajectory metadata");
++      });
++    const workspace = yield* decode(() => decodeAntigravityWorkspace(meta[0]!.data));
++    const identity = yield* sql.unsafe<{ cascade_id: string }>(
++      "SELECT cascade_id FROM trajectory_meta LIMIT 2",
++    );
++    if (identity.length !== 1 || !/^[0-9a-f-]{36}$/i.test(identity[0]!.cascade_id)) {
++      return yield* decode(() => {
++        throw new Error("Invalid trajectory identity");
++      });
++    }
++    const messages: Array<{ role: "user" | "assistant"; text: string; createdAt: string }> = [];
++    let attachmentMessages = 0;
++    let bytes = 0;
++    let stepCount = 0;
++    let after = -1;
++    if (!metadataOnly)
++      while (true) {
++        const rows = yield* sql.unsafe<{
++          idx: number;
++          step_type: number;
++          step_format: number;
++          step_payload: Uint8Array | null;
++          metadata: Uint8Array | null;
++        }>(
++          `SELECT idx, step_type, step_format,
++        CASE WHEN length(step_payload) <= ? THEN step_payload ELSE NULL END AS step_payload,
++        CASE WHEN length(metadata) <= ? THEN metadata ELSE NULL END AS metadata
++        FROM steps WHERE idx > ? ORDER BY idx LIMIT 32`,
++          [MAX_STEP_BYTES, MAX_STEP_BYTES, after],
++        );
++        for (const row of rows) {
++          if (++stepCount > MAX_STEPS)
++            return yield* decode(() => {
++              throw new Error("Antigravity step limit exceeded");
++            });
++          const message = yield* decode(() => decodeAntigravityMessage(row));
++          if (!message) continue;
++          const createdAt = message.createdAt ?? workspace.createdAt;
++          if (createdAt === null)
++            return yield* decode(() => {
++              throw new Error("Missing message timestamp");
++            });
++          if (message.hasAttachments) attachmentMessages++;
++          const text =
++            message.text +
++            (message.hasAttachments
++              ? "\n\n[Attachment present in the original Antigravity conversation; attachment data was not imported.]"
++              : "");
++          bytes += Buffer.byteLength(text, "utf8");
++          if (bytes > MAX_TEXT_BYTES)
++            return yield* decode(() => {
++              throw new Error("Antigravity history exceeds the 32 MiB import limit");
++            });
++          messages.push({ role: message.role, text, createdAt });
++        }
++        if (rows.length < 32) break;
++        after = rows[rows.length - 1]!.idx;
++      }
++    return {
++      ...workspace,
++      sessionId: identity[0]!.cascade_id,
++      messages,
++      attachmentMessages,
++      stepCount,
++      title: "",
++    };
++  }).pipe(sql.withTransaction);
++});
++
++export const readAntigravitySession = Effect.fn("readAntigravitySession")(function* (
++  path: string,
++  metadataOnly = false,
++) {
++  if (path.endsWith(".trajectory.json")) {
++    const fs = yield* FileSystem.FileSystem;
++    const stat = yield* fs.stat(path);
++    if (stat.size > BigInt(128 * 1024 * 1024)) {
++      return yield* new AntigravityTranscriptError({
++        path,
++        cause: new Error("Trajectory export exceeds 128 MiB"),
++      });
++    }
++    const contents = yield* fs.readFileString(path);
++    const value = yield* decodeTrajectoryJson(contents);
++    return yield* Effect.try({
++      try: () => decodeAntigravityTrajectory(value),
++      catch: (cause) => new AntigravityTranscriptError({ path, cause }),
++    });
++  }
++  return yield* read(path, metadataOnly).pipe(
++    Effect.provide(NodeSqliteClient.layer({ filename: path, readonly: true })),
++  );
++});
+diff --git a/apps/server/src/project/AntigravityTranscript.ts b/apps/server/src/project/AntigravityTranscript.ts
+new file mode 100644
+index 00000000..9188ffab
+--- /dev/null
++++ b/apps/server/src/project/AntigravityTranscript.ts
+@@ -0,0 +1,199 @@
++import * as NodeURL from "node:url";
++import * as DateTime from "effect/DateTime";
++
++type Field = number | bigint | Uint8Array;
++type Fields = Map<number, Field[]>;
++
++function fields(bytes: Uint8Array): Fields {
++  let offset = 0;
++  const result: Fields = new Map();
++  const varint = () => {
++    let value = 0n;
++    for (let shift = 0n; shift < 70n; shift += 7n) {
++      const byte = bytes[offset++];
++      if (byte === undefined || (shift === 63n && byte > 1)) {
++        throw new Error("Invalid Antigravity protobuf varint");
++      }
++      value |= BigInt(byte & 127) << shift;
++      if (byte < 128) return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value;
++    }
++    throw new Error("Invalid Antigravity protobuf varint");
++  };
++  while (offset < bytes.length) {
++    const tag = varint();
++    if (typeof tag !== "number" || tag < 8 || tag > 0xffffffff) {
++      throw new Error("Invalid Antigravity protobuf tag");
++    }
++    const key = Math.floor(tag / 8);
++    const wire = tag % 8;
++    let value: Field;
++    if (wire === 0) value = varint();
++    else if (wire === 1 || wire === 2 || wire === 5) {
++      const length = wire === 2 ? varint() : wire === 1 ? 8 : 4;
++      if (typeof length !== "number" || length > bytes.length - offset) {
++        throw new Error("Truncated Antigravity protobuf field");
++      }
++      value = bytes.subarray(offset, offset + length);
++      offset += length;
++      if (wire !== 2) continue;
++    } else throw new Error("Unsupported Antigravity protobuf wire type");
++    const entries = result.get(key) ?? [];
++    entries.push(value);
++    result.set(key, entries);
++  }
++  return result;
++}
++
++function blob(value: unknown): Uint8Array {
++  if (!(value instanceof Uint8Array)) throw new Error("Invalid Antigravity protobuf blob");
++  return value;
++}
++
++function nested(value: Fields, key: number): Fields {
++  const entry = value.get(key)?.[0];
++  return entry === undefined ? new Map() : fields(blob(entry));
++}
++
++function text(value: Fields, key: number): string {
++  const entry = value.get(key)?.[0];
++  return entry === undefined ? "" : new TextDecoder("utf-8", { fatal: true }).decode(blob(entry));
++}
++
++function timestamp(value: Fields): string | null {
++  const seconds = value.get(1)?.[0];
++  const nanos = value.get(2)?.[0] ?? 0;
++  if (seconds === undefined) return null;
++  if (typeof seconds !== "number" || typeof nanos !== "number" || nanos < 0 || nanos >= 1e9) {
++    throw new Error("Invalid Antigravity timestamp");
++  }
++  return DateTime.formatIso(DateTime.makeUnsafe(seconds * 1000 + Math.floor(nanos / 1e6)));
++}
++
++export function decodeAntigravityWorkspace(metadata: Uint8Array) {
++  const root = fields(metadata);
++  const uris = (root.get(7) ?? []).map((value) =>
++    new TextDecoder("utf-8", { fatal: true }).decode(blob(value)),
++  );
++  for (const workspace of root.get(1) ?? []) {
++    const uri = text(fields(blob(workspace)), 1);
++    if (uri) uris.push(uri);
++  }
++  return {
++    paths: [...new Set(uris.map((uri) => NodeURL.fileURLToPath(uri)))],
++    createdAt: timestamp(nested(root, 2)),
++  };
++}
++
++export function decodeAntigravityMessage(row: {
++  readonly step_type: number;
++  readonly step_format: number;
++  readonly step_payload: unknown;
++  readonly metadata: unknown;
++}) {
++  if (row.step_type !== 14 && row.step_type !== 15) return null;
++  if (row.step_format !== 0) throw new Error("Unsupported Antigravity step encoding");
++  const root = fields(blob(row.step_payload));
++  if (root.get(1)?.[0] !== row.step_type) throw new Error("Antigravity step type mismatch");
++  const payload = nested(root, row.step_type === 14 ? 19 : 20);
++  let content: string;
++  if (row.step_type === 14) {
++    content = text(payload, 2) || text(payload, 1);
++    if (!content) {
++      content = (payload.get(3) ?? [])
++        .map((item) => text(fields(blob(item)), 1))
++        .filter(Boolean)
++        .join("\n");
++    }
++  } else content = text(payload, 8) || text(payload, 1);
++  const hasAttachments = row.step_type === 14 && (payload.has(5) || payload.has(9));
++  if (!content.trim() && !hasAttachments) return null;
++  const metadata = row.metadata === null ? nested(root, 5) : fields(blob(row.metadata));
++  return {
++    role: row.step_type === 14 ? ("user" as const) : ("assistant" as const),
++    text: content,
++    createdAt: timestamp(nested(metadata, 1)),
++    hasAttachments,
++  };
++}
++
++function object(value: unknown): Record<string, unknown> {
++  if (typeof value !== "object" || value === null || Array.isArray(value)) {
++    throw new Error("Invalid Antigravity trajectory object");
++  }
++  return value as Record<string, unknown>;
++}
++
++function string(value: unknown): string {
++  if (value === undefined) return "";
++  if (typeof value !== "string") throw new Error("Invalid Antigravity text");
++  return value;
++}
++
++function iso(value: unknown): string | null {
++  const text = string(value);
++  return text ? DateTime.formatIso(DateTime.makeUnsafe(text)) : null;
++}
++
++export function decodeAntigravityTrajectory(value: unknown) {
++  const root = object(value);
++  const sessionId = string(root.cascadeId);
++  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionId)) {
++    throw new Error("Invalid Antigravity conversation ID");
++  }
++  const metadata = object(root.metadata ?? {});
++  const imported = object(root.t3Import ?? {});
++  const workspaces = metadata.workspaces ?? [];
++  const steps = root.steps ?? [];
++  if (!Array.isArray(workspaces) || !Array.isArray(steps) || steps.length > 100_000) {
++    throw new Error("Invalid Antigravity trajectory collection");
++  }
++  const paths = workspaces.map((workspace) =>
++    NodeURL.fileURLToPath(string(object(workspace).workspaceFolderAbsoluteUri)),
++  );
++  const workspaceOverride = string(imported.workspaceRoot);
++  if (workspaceOverride) paths.splice(0, paths.length, workspaceOverride);
++  const createdAt = iso(metadata.createdAt);
++  const messages: Array<{ role: "user" | "assistant"; text: string; createdAt: string }> = [];
++  let attachmentMessages = 0;
++  let bytes = 0;
++  for (const value of steps) {
++    const step = object(value);
++    const user = step.type === "CORTEX_STEP_TYPE_USER_INPUT";
++    const assistant = step.type === "CORTEX_STEP_TYPE_PLANNER_RESPONSE";
++    const notification = step.type === "CORTEX_STEP_TYPE_NOTIFY_USER";
++    if (!user && !assistant && !notification) continue;
++    const payload = object(
++      user ? step.userInput : assistant ? step.plannerResponse : step.notifyUser,
++    );
++    const raw = user
++      ? string(payload.userResponse) || string(payload.query)
++      : assistant
++        ? string(payload.modifiedResponse) || string(payload.response)
++        : string(payload.notificationContent);
++    const hasAttachments =
++      user &&
++      [payload.images, payload.media].some((items) => Array.isArray(items) && items.length > 0);
++    if (!raw.trim() && !hasAttachments) continue;
++    const text =
++      raw +
++      (hasAttachments
++        ? "\n\n[Attachment present in the original Antigravity conversation; attachment data was not imported.]"
++        : "");
++    if (hasAttachments) attachmentMessages++;
++    bytes += Buffer.byteLength(text, "utf8");
++    if (bytes > 32 * 1024 * 1024)
++      throw new Error("Antigravity history exceeds the 32 MiB import limit");
++    const at = iso(object(step.metadata ?? {}).createdAt) ?? createdAt;
++    if (at === null) throw new Error("Missing Antigravity message timestamp");
++    messages.push({ role: user ? "user" : "assistant", text, createdAt: at });
++  }
++  return {
++    sessionId,
++    paths: [...new Set(paths)],
++    createdAt,
++    messages,
++    attachmentMessages,
++    stepCount: steps.length,
++    title: string(imported.title),
++  };
++}
+diff --git a/apps/server/src/project/AntigravityTranscript.test.ts b/apps/server/src/project/AntigravityTranscript.test.ts
+new file mode 100644
+index 00000000..8b487917
+--- /dev/null
++++ b/apps/server/src/project/AntigravityTranscript.test.ts
+@@ -0,0 +1,119 @@
++import * as NodeURL from "node:url";
++import { describe, expect, it } from "vite-plus/test";
++import {
++  decodeAntigravityMessage,
++  decodeAntigravityWorkspace,
++  decodeAntigravityTrajectory,
++} from "./AntigravityTranscript.ts";
++
++function varint(value: number): number[] {
++  const bytes: number[] = [];
++  do {
++    const byte = value % 128;
++    value = Math.floor(value / 128);
++    bytes.push(byte | (value ? 128 : 0));
++  } while (value);
++  return bytes;
++}
++
++function message(...entries: [number, number | string | Uint8Array][]): Uint8Array {
++  return Uint8Array.from(
++    entries.flatMap(([key, value]) => {
++      if (typeof value === "number") return [...varint(key * 8), ...varint(value)];
++      const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
++      return [...varint(key * 8 + 2), ...varint(bytes.length), ...bytes];
++    }),
++  );
++}
++
++const metadata = message([1, message([1, 1700000000], [2, 123000000])]);
++const row = (type: number, payload: Uint8Array) => ({
++  step_type: type,
++  step_format: 0,
++  metadata,
++  step_payload: message([1, type], [type === 14 ? 19 : 20, payload]),
++});
++
++describe("Antigravity transcript decoding", () => {
++  it("preserves user text once, timestamps, and attachment presence", () => {
++    const decoded = decodeAntigravityMessage(
++      row(
++        14,
++        message(
++          [2, "  Explain λ\nnext line  "],
++          [3, message([1, "duplicate representation"])],
++          [9, message([1, "image"])],
++        ),
++      ),
++    );
++    expect(decoded).toEqual({
++      role: "user",
++      text: "  Explain λ\nnext line  ",
++      createdAt: "2023-11-14T22:13:20.123Z",
++      hasAttachments: true,
++    });
++  });
++
++  it("uses the displayed response and excludes thinking and tool-only replies", () => {
++    expect(
++      decodeAntigravityMessage(
++        row(15, message([1, "raw response"], [8, "displayed response"], [3, "internal reasoning"])),
++      )?.text,
++    ).toBe("displayed response");
++    expect(
++      decodeAntigravityMessage(row(15, message([3, "thinking"], [7, message([1, "tool"])]))),
++    ).toBeNull();
++    expect(decodeAntigravityMessage({ ...row(21, message()), step_payload: null })).toBeNull();
++  });
++
++  it("rejects corrupt blobs, mismatched types, and unsupported encodings", () => {
++    expect(() =>
++      decodeAntigravityMessage({ ...row(14, message()), step_payload: Uint8Array.of(0x9a, 1, 20) }),
++    ).toThrow();
++    expect(() => decodeAntigravityMessage({ ...row(14, message()), step_type: 15 })).toThrow(
++      /mismatch/,
++    );
++    expect(() => decodeAntigravityMessage({ ...row(14, message()), step_format: 1 })).toThrow(
++      /encoding/,
++    );
++    expect(() => decodeAntigravityMessage(row(14, message([2, Uint8Array.of(255)])))).toThrow();
++  });
++
++  it("decodes and deduplicates workspace URIs without splitting paths with spaces", () => {
++    const cwd = NodeURL.fileURLToPath(
++      new URL("workspace%20with%20spaces", NodeURL.pathToFileURL(process.cwd() + "/")),
++    );
++    const uri = NodeURL.pathToFileURL(cwd).href;
++    expect(
++      decodeAntigravityWorkspace(
++        message([7, uri], [1, message([1, uri])], [2, message([1, 1700000000])]),
++      ),
++    ).toEqual({ paths: [cwd], createdAt: "2023-11-14T22:13:20.000Z" });
++    expect(() => decodeAntigravityWorkspace(message([7, "https://example.com"]))).toThrow();
++  });
++});
++
++it("decodes legacy JSON exports, preserves attachment-only turns, and rejects invalid identities", () => {
++  const input = {
++    cascadeId: "11111111-1111-4111-8111-111111111111",
++    metadata: { createdAt: "2026-01-01T00:00:00Z" },
++    t3Import: { workspaceRoot: process.cwd(), title: "Legacy chat" },
++    steps: [
++      { type: "CORTEX_STEP_TYPE_USER_INPUT", userInput: { media: [{ mimeType: "image/png" }] } },
++      {
++        type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
++        plannerResponse: { response: "Image description", thinking: "private reasoning" },
++      },
++      { type: "CORTEX_STEP_TYPE_RUN_COMMAND", runCommand: { commandLine: "never execute this" } },
++    ],
++  };
++  const result = decodeAntigravityTrajectory(input);
++  expect(result.messages).toHaveLength(2);
++  expect(result.messages[0]?.role).toBe("user");
++  expect(result.messages[0]?.text).toContain("attachment data was not imported");
++  expect(result.messages[1]?.text).toBe("Image description");
++  expect(result.paths).toEqual([process.cwd()]);
++  expect(result.attachmentMessages).toBe(1);
++  expect(() => decodeAntigravityTrajectory({ ...input, cascadeId: "../invalid" })).toThrow();
++  expect(() => decodeAntigravityTrajectory({ ...input, steps: "invalid" })).toThrow();
++});

@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.patch -text whitespace=-blank-at-eol
+*.cmd text eol=crlf
